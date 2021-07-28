@@ -1,0 +1,468 @@
+using module /Users/codykellogg/workspace/powershell/modules/DsPwshClasses
+#using module /Users/codykellogg/workspace/powershell/modules/AwsFunctions
+
+$Global:MaximumHistoryCount = 32000
+
+# Set vars
+
+$global:src = "$HOME/workspace"
+$sep = ":"
+
+
+function SetPromptAzure { $Global:PromptAzure = $True; $Global:PromptK8s = $False }
+function SetPromptK8s { $Global:PromptAzure = $False; $Global:PromptK8s = $True }
+function SetPrompt { $Global:PromptAzure = $False; $Global:PromptK8s = $False }
+
+function Prompt {
+    if ($Global:PromptAzure) {
+        $AzContextPath = "$HOME/.azure/AzureRmContext.json"
+        if (Test-Path $AzContextPath) {
+            $X = (cat $AzContextPath | jq . | ConvertFrom-Json).DefaultContextKey
+            $Ctx = $X.Split(' (')[0]
+            #            $Ctx = (Get-AzContext).Subscription.Name
+            if ($Ctx -eq "DirectScale") { $Color = "Red" } else { $Color = "Yellow" }
+            (Write-Host "[$Ctx] " -ForegroundColor $Color -NoNewline)
+            (Write-Host "$(get-date -Format HH:mm:ss) PS " -NoNewline)
+        }
+    }
+    elseif ($Global:PromptK8s) {
+        $Config = kubectl config view --minify -o json | ConvertFrom-Json
+        $NS = $Config.contexts.context.namespace
+        $Cluster = $Config.contexts.context.cluster
+        if ($Cluster -like "*-live*") { $Color = "Red" } else { $Color = "Yellow" }
+        (Write-Host "[${Cluster}_${NS}] " -ForegroundColor $Color -NoNewline)
+        (Write-Host "$(get-date -Format HH:mm:ss) PS " -NoNewline)
+    }
+    else {
+        $Color = Get-Random -Min 1 -Max 16
+        (Write-Host "$(get-date -Format HH:mm:ss) PS " -NoNewLine -ForegroundColor $Color)
+    }
+    $Loc = Get-Location
+    if ($Loc -like "$HOME*") { $Loc = $Loc -replace $HOME, '~' }
+    Write-Host ("$Loc>") -NoNewline
+    return " "
+}
+
+
+$DsPsModulePath = "$src/powershell/modules"
+$ENV:PSModulePath += "${sep}$DsPsModulePath"
+
+
+# Override the default powershell prompt
+
+$Global:PromptAzure = $False
+$Global:PromptK8s = $False
+
+#region personal functions
+function GitUntrackedFiles () {
+    $p = $PWD
+    $GitRoot = git rev-parse --show-toplevel
+    cd $GitRoot
+    $Files = git ls-files --others | grep -vi ds_store
+
+    Write-Header "All Files"
+    $Files
+    New-Separator
+    New-Separator
+
+    foreach ($File in $Files) {
+        $Done = $false
+        do {
+            "`n`n"
+            Write-Header $File -Underline
+            $A = Read-Host "Action:`n[R] Remove`n[C] Cat the file`n[A] 'git add' the file`n[N] Do nothing"
+            switch ($A) {
+                "R" { Remove-Item $File -Force; $Done = $true }
+                "C" { cat $File; $Done = $false }
+                "A" { git add $File; $Done = $true }
+                "N" { $Done = $true }
+                default { Write-Host "invalid answer given, try again" -ForegroundColor Yellow }
+            }
+        } until ($Done)
+    }
+
+    cd $p
+}
+
+function pwatch ($block, [int]$Sleep = 4, [switch] $NoClear) {
+    while ($true) {
+        if (!$NoClear) {
+            Get-Date
+            clear
+        }
+        &$block
+        sleep $Sleep
+    }
+}
+
+function SPathRecursively {
+    [CmdletBinding()] param ( [string] $SearchString, [string] $FilterOut, [string] $Path = $PWD, [string] $Header, [switch] $Raw)
+    if (!$Header) { $Header = $Path }
+    if (!$PSBoundParameters.ContainsKey('InformationAction')) { $InformationPreference = "Continue" }
+    $Files = Get-ChildItem -Path $Path -Recurse -Exclude .git, "*f189b81d.js*" -File
+    $Matches = $Files | Select-String -Pattern $SearchString
+    if ($FilterOut) { $Matches = $Matches | Select-String -Pattern $FilterOut -NotMatch }
+    Write-Host "`n=====================================================================================================================" -ForegroundColor Yellow
+    Write-Host "#    $Header    #" -ForegroundColor Blue
+    Write-Host "=====================================================================================================================" -ForegroundColor Yellow
+    if ($Matches) {
+        if ($Raw) { $Matches.Line } else { $Matches }
+        $Global:FilesWithMatches = $Global:FilesWithMatches = $Matches.Path | Sort-Object -Unique
+        Write-Information "`nMatch Count: $($Matches.Count)" -InformationAction $InformationPreference
+        Write-Information "Files with matches [$($Global:FilesWithMatches.Count)] ----> `$Global:FilesWithMatches" -InformationAction $InformationPreference
+    }
+}
+
+function SDevopsRepos ([string] $SearchString, [switch] $Raw) {
+    $Repos = @(
+        "teamcity"
+        "DevOps"
+        "powershell"
+        "helm"
+        "openfaas"
+    )
+    $MatchCount = 0
+    $Global:FileList = @()
+    foreach ($Repo in $Repos) {
+        if ($Repo -eq "teamcity") {
+            $Matches = SPathRecursively -SearchString $SearchString -Path $src/$Repo/.teamcity -Header $Repo -InformationAction SilentlyContinue
+        }
+        else {
+            $Matches = SPathRecursively -SearchString $SearchString -Path $src/$Repo -Header $Repo -InformationAction SilentlyContinue
+        }
+        if ($Matches) {
+            if ($Raw) { $Matches.Line } else { $Matches }
+            $MatchCount += $Matches.Count
+            $Global:FileList += $Matches.Path | Sort-Object -Unique
+        }
+    }
+    Write-Host "`nMatch Count: $MatchCount" -ForegroundColor Magenta
+    Write-Host "File list [$($Global:FileList.Count)] ---> `$Global:FileList" -ForegroundColor Magenta
+}
+
+function clm {
+    1..100 | % { "`n" }; clear
+}
+
+
+function dsl { Select-DsAzSubscription -Env Live }
+
+function dsp { Select-DsAzSubscription -Env Prelive }
+
+function find {
+    param(
+        [string]$path,
+        [string]$type,
+        [string]$name
+    )
+    if ($type -eq 'f') { Get-ChildItem -Path $path -Name $name -Recurse -File }
+    elseif ($type -eq 'd') { Get-ChildItem -Path $path -Name $name -Recurse -Directory }
+    else { Get-ChildItem -Path $path -Name $name -Recurse }
+}
+
+if (Test-Path Alias:ls) { Remove-Item Alias:ls }
+function ls {
+    param(
+        [switch]$ltr,
+        [switch]$la,
+        [switch]$l,
+        [string]$arg
+    )
+    if ($PSBoundParameters.Count -eq 0) { (gci).Name -join "    " }
+    if ($l) { gci $arg }
+    if ($la) { gci -Force $arg }
+    if ($ltr) { gci $arg | Sort-Object -Property LastWriteTime }
+}
+
+function funcCode {
+    param(
+        [string]$func
+    )
+    (Get-Command $func).Definition
+}
+
+function time($block) {
+    (Get-Date).DateTime
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    try {
+        &$block
+    }
+    catch {
+        throw $_
+    }
+    finally {
+        $sw.Stop()
+        (Get-Date).DateTime
+        $min = $sw.Elapsed.TotalMinutes.toString().split(".")[0]
+        $sec = $sw.Elapsed.Seconds.toString()
+        if ($min -eq "0") {
+            "Seconds: $sec"
+        }
+        Else {
+            "Minutes: $min"
+            "Seconds: $sec"
+        }
+    }
+}
+
+
+Remove-Item Alias:cd -Force -ErrorAction SilentlyContinue
+function cd {
+    if ($args[0] -eq '-') {
+        $pwd = $OLDPWD
+    }
+    elseif (!$args[0]) {
+        Set-Location $HOME
+    }
+    else {
+        $pwd = $args[0]
+    }
+    $tmp = pwd
+
+    if ($pwd) {
+        Set-Location $pwd
+    }
+    Set-Variable -Name OLDPWD -Value $tmp -Scope global
+}
+
+function Format-Xml {
+    <#
+  .SYNOPSIS
+  Format the incoming object as the text of an XML document.
+#>
+    param(
+        ## Text of an XML document.
+        [Parameter(ValueFromPipeline = $true)]
+        [string[]]$Text
+    )
+
+    begin {
+        $data = New-Object System.Collections.ArrayList
+    }
+    process {
+        [void] $data.Add($Text -join "`n")
+    }
+    end {
+        $doc = New-Object System.Xml.XmlDataDocument
+        $doc.LoadXml($data -join "`n")
+        $sw = New-Object System.Io.Stringwriter
+        $writer = New-Object System.Xml.XmlTextWriter($sw)
+        $writer.Formatting = [System.Xml.Formatting]::Indented
+        $doc.WriteContentTo($writer)
+        $sw.ToString()
+    }
+}
+
+function gf ([int] $n) {
+    $f = 1
+    while ($n -gt 0) {
+        wh -f magenta $n
+        $f = $f * $n
+        $n--
+    }
+    return $f
+}
+function ll { /bin/ls -lah }
+function reload { .$profile }
+function rc { code $profile }
+function te { echo "hi" }
+function cont { kubectl config get-contexts }
+
+function kucheck {
+    kubectl config get-contexts
+}
+function kuswitch {
+    param (
+        [string]$context
+    )
+    if ($context) {
+        kubectl config use-context $context
+    }
+    else {
+        $context = (kubectl config get-contexts) | where { ($_.contains("*")) }
+        if ($context.contains("aks-prelive")) { kubectl config use-context aks2-live }
+        if ($context.contains("aks2-live")) { kubectl config use-context aks-prelive-westus }
+    }
+}
+#endregion personal functions
+
+#region aliases (or functions that 'function' as aliases)
+Set-Alias dss Get-AzContext
+Set-Alias wh Write-Host
+Set-Alias which Get-Command
+Set-Alias slo Select-Object
+Set-Alias rmj Remove-Job
+Set-Alias rj Receive-Job
+Set-Alias gj Get-Job
+Set-Alias sj Start-Job
+Set-Alias wj Wait-Job
+Set-Alias l ll
+#Set-Alias ll dir
+Set-Alias mc Measure-Command
+Set-Alias kube kubectl
+Set-Alias ku kubectl
+Set-Alias gh Get-Help
+Set-Alias gfh Get-FileHash
+
+
+function curcontext { kubectl config get-contexts (kubectl config current-context) }
+function admin { powershell -new_console:a }
+function startSalt { dsl; time { Start-AzureRmVM -Name salt-master -ResourceGroupName corp-westus-resourcegroup } }
+function stopSalt { dsl; time { Stop-AzureRmVM -Name salt-master -ResourceGroupName corp-westus-resourcegroup -Force } }
+function psprof { vsedit $profile }
+function src { cd ~/workspace; dir }
+function ws { cd ~/workspace }
+# function c {
+#     [CmdletBinding()]
+#     param (
+#         [Parameter(Position=0)]
+#         [string]$File,
+#         [Parameter(Position=1)]
+#         [string]$LineNumber
+#         )
+
+#     code -g ${File}
+# }
+function wtf {
+    <#
+    .SYNOPSIS
+    Get Client details when alerts go off
+    .PARAMETER Client
+    Client ID (Dynamically pulled from CD_Clients)
+    .EXAMPLE
+    wtf hacked
+    #>
+    [CmdletBinding()]
+    param()
+    dynamicparam {
+        $ValidateSet = New-DynamicParameter -ParameterName Client -ValidateSetCommand "Get-DsClientList -IncludeInternalClients" -ParameterPosition 0
+        return $ValidateSet
+    }
+    begin {
+        $Client = $PSBoundParameters['Client']
+    }
+    process {
+        Get-DiscoStatsStatus -Client $Client -Env live -PrettyPrint
+        Get-DiscoReleases -Client $Client -Env live -NumberOfReleases 5
+
+    }
+}
+
+function rlm {
+    [CmdletBinding()]
+    param()
+    dynamicparam {
+        $ValidateSet = New-DynamicParameter -ParameterName Module -ValidateSetCommand " `$ENV:PSModulePath -split ':' | % { (Get-ChildItem `$_ -Directory).Name }"  -ParameterPosition 0
+        return $ValidateSet
+    }
+    begin {
+        $Module = $PSBoundParameters['Module']
+    }
+    process {
+        try {
+            # Check to see if the setting is already there.  Fail if it does
+            Remove-Module $Module -ErrorAction stop
+        }
+        catch {
+            if ( $_ -like "*No modules were removed. Verify that the specification*"){}
+            else{
+                Write-Error ($_)
+            }
+        }
+        finally {
+            Import-Module $Module
+        }
+    }
+}
+
+function openFunc {
+    [CmdletBinding()]
+    param (
+        [Parameter(Position=0)]
+        [string]$FunctionName
+    )
+    $ModulePath = (Get-Module (Get-Command $FunctionName).Module.Name).path
+    Write-Output "Module: $(((Get-Command $FunctionName)).Module.Name)"
+    Write-Output $ModulePath
+    $LineNumber = (Select-String -Pattern "function $FunctionName[ ]*{" $ModulePath).LineNumber
+    Write-Output "Line Number:  $LineNumber"
+    code -g ${ModulePath}:${LineNumber}
+
+}
+
+
+function openMod {
+    [CmdletBinding()]
+    param (
+        [Parameter(Position = 0)]
+        [string]$ModuleName,
+        [Parameter(Position = 1)]
+        [string]$LineNumber
+    )
+    $ModulePath = (Get-Module $ModuleName).Path
+    if (!$ModulePath) { Import-Module $ModuleName; $ModulePath = (Get-Module $ModuleName).Path }
+    Write-Output $ModulePath
+    if ($LineNumber) { code -g ${ModulePath}:${LineNumber} }
+    else { code $ModulePath }
+}
+function oClass {
+    [CmdletBinding()]
+    param()
+    dynamicparam {
+        $ValidateSet = New-DynamicParameter -ParameterName ClassName -ValidateSetCommand "(Get-ModuleClasses -Module DsPwshClasses).Name | Sort-Object -Unique" -ParameterPosition 0 -Mandatory $true
+        return $ValidateSet
+    }
+    begin {
+        $ClassName = $PSBoundParameters['ClassName']
+    }
+    process {
+        $DsPwshClassesPath = "$src/powershell/modules/DsPwshClasses/DsPwshClasses.psm1"
+        $LineNumber = (Select-String -Pattern "class $ClassName" $DsPwshClassesPath).LineNumber
+        Write-Output "Line Number:  $LineNumber"
+        code -g ${DsPwshClassesPath}:${LineNumber}
+    }
+}function con {vim ~/.ssh/config}
+function dev {cd ~/workspace/devops; ll}
+function pow {cd ~/workspace/powershell; ll}
+function team {cd ~/workspace/teamcity; ll}
+function mod {cd ~/workspace/powershell/modules; ll}
+function Search-History {
+	param (
+		[Parameter(Position=0)]
+		[string]$SearchString
+	)
+    Get-Content /Users/codykellogg/.local/share/powershell/PSReadline/ConsoleHost_history.txt | ? { $_ -like "*${SearchString}*" }
+}
+#endregion aliases
+
+# Client view env
+$env:Environment="live"
+$env:authAccountKey="Er0b9/3+GNCnnRqLC6N27+dGNRnPq4ryKOKV3Zmx9r+XO5Q5BFneptgSBk0zjl+8Vzf4E23dobL3n1yADYi70g=="
+$env:fileAccountKey="JYW26fWy/sgC3LsmJXLgzZrq2BkOLqxUt995tQQTpRnU423yNwqGbXEdlfnERc3A3puRAT+EWa/eKUPqS15EyQ=="
+$env:buildAccessToken="tczoxfrtp2dqdtdx3ys2gteihdzncrlsgjh3sgkxigh2lixu5awq"
+$env:env="live"
+$env:userId="DirectScaleUser"
+$env:password="7oKuLsdCkh4Jjik1"
+$env:initialCatalog="datawarehouse-live"
+$env:dataSource="datawarehouse-westus-sqlserver.database.windows.net"
+
+#region VI command line mode stuff
+Set-PSReadlineOption -EditMode Vi
+Set-PSReadlineKeyHandler -Key Shift+B -Function SelectShellBackwardWord -ViMode Command
+Set-PSReadlineKeyHandler -Key Shift+W -Function SelectShellForwardWord -ViMode Command
+Set-PSReadlineKeyHandler -Key F8 -Function HistorySearchBackward -ViMode Insert
+Set-PSReadlineKeyHandler -Key Ctrl+r -Function ReverseSearchHistory
+if ($ENV:OS -like "Windows*") {
+    Set-PSReadlineKeyHandler -Key Ctrl+[ -Function ViCommandMode
+}
+elseif ($ENV:OS -eq "Mac") {
+    Set-PSReadlineKeyHandler -Key Shift+4 -Function MoveToEndOfLine -ViMode Command
+}
+
+#endregion VI command line mode stuff
+
+# Chocolatey profile
+$ChocolateyProfile = "$env:ChocolateyInstall\helpers\chocolateyProfile.psm1"
+if (Test-Path($ChocolateyProfile)) {
+    Import-Module "$ChocolateyProfile"
+}
